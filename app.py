@@ -1,15 +1,13 @@
 """
 ================================================================
-APLIKACJA: Analizator Sygnałów Giełdowych
+APLIKACJA: Analizator Sygnałów Giełdowych - Watchlist
 ================================================================
-Prosta aplikacja webowa (Streamlit) - wpisujesz ticker, klikasz
-"Analizuj", dostajesz sygnał BUY/SELL/HOLD + wykres + uzasadnienie.
+Wpisujesz listę tickerów, aplikacja sama się odświeża w ustalonym
+interwale i pokazuje tabelę sygnałów dla wszystkich naraz.
 
 Uruchomienie:
-    pip3 install streamlit yfinance pandas numpy plotly
+    pip3 install streamlit yfinance pandas numpy plotly streamlit-autorefresh
     streamlit run app.py
-
-Otworzy się w przeglądarce na http://localhost:8501
 ================================================================
 """
 
@@ -18,11 +16,12 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
 
 SIGNAL_THRESHOLD = 3
 
 # ============================================================
-# WSKAŹNIKI (identyczna logika jak w signal_analyzer.py)
+# WSKAŹNIKI
 # ============================================================
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -145,63 +144,99 @@ def generate_signal(df: pd.DataFrame) -> dict:
     return {"signal": signal, "score": score, "price": last["Close"], "reasons": reasons, "df": df}
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_and_analyze(ticker: str, timeframe: str, period: str):
+    df = yf.download(ticker, period=period, interval=timeframe, progress=False, auto_adjust=True)
+    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+        df.columns = df.columns.get_level_values(0)
+    if df.empty or len(df) < 55:
+        return None
+    return generate_signal(df)
+
+
 # ============================================================
 # UI
 # ============================================================
 
-st.set_page_config(page_title="Analizator Sygnałów", page_icon="📈", layout="centered")
+st.set_page_config(page_title="Analizator Sygnałów", page_icon="📈", layout="wide")
 
-st.title("📈 Analizator Sygnałów Giełdowych")
-st.caption("Wpisz ticker, wybierz interwał i sprawdź sygnał techniczny na żywo.")
+st.title("📈 Analizator Sygnałów Giełdowych — Watchlist")
+st.caption("Lista obserwowanych instrumentów, sama się odświeża. Kliknij ticker poniżej, aby zobaczyć szczegóły.")
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    ticker = st.text_input(
-        "Instrument (ticker)",
-        value="AAPL",
-        placeholder="np. AAPL, BTC-USD, XRP-USD, TSLA, EURUSD=X",
-    ).strip().upper()
-with col2:
+with st.sidebar:
+    st.header("Ustawienia")
+    default_tickers = "AAPL\nMSFT\nNVDA\nBTC-USD\nETH-USD\nXRP-USD\nLBW.WA"
+    tickers_input = st.text_area(
+        "Lista tickerów (jeden na linię)",
+        value=default_tickers,
+        height=180,
+    )
     timeframe = st.selectbox("Interwał świec", ["15m", "1h", "1d"], index=1)
+    refresh_seconds = st.number_input(
+        "Auto-odśwież co (sekund)", min_value=15, max_value=3600, value=60, step=15
+    )
+    st.caption("To narzędzie analityczne, nie porada inwestycyjna.")
 
 period_map = {"15m": "60d", "1h": "180d", "1d": "2y"}
+tickers = [t.strip().upper() for t in tickers_input.splitlines() if t.strip()]
 
-analyze = st.button("🔍 Analizuj", type="primary", use_container_width=True)
+st_autorefresh(interval=refresh_seconds * 1000, key="refresh_watchlist")
 
-if analyze and ticker:
-    with st.spinner(f"Pobieram dane dla {ticker}..."):
+st.caption(f"Ostatnie odświeżenie danych: {pd.Timestamp.now().strftime('%H:%M:%S')} · odświeża się co {refresh_seconds}s")
+
+rows = []
+results_by_ticker = {}
+
+with st.spinner("Analizuję listę instrumentów..."):
+    for ticker in tickers:
         try:
-            df = yf.download(
-                ticker, period=period_map[timeframe], interval=timeframe,
-                progress=False, auto_adjust=True,
-            )
-            if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
-                df.columns = df.columns.get_level_values(0)
+            result = fetch_and_analyze(ticker, timeframe, period_map[timeframe])
         except Exception as e:
-            st.error(f"Błąd pobierania danych: {e}")
-            df = None
+            result = None
+        if result is None:
+            rows.append({"Ticker": ticker, "Cena": None, "Sygnał": "BŁĄD", "Punkty": None})
+            continue
+        results_by_ticker[ticker] = result
+        rows.append({
+            "Ticker": ticker,
+            "Cena": round(result["price"], 4),
+            "Sygnał": result["signal"],
+            "Punkty": result["score"],
+        })
 
-    if df is None or df.empty:
-        st.error(f"Nie znaleziono danych dla '{ticker}'. Sprawdź czy ticker jest poprawny (format Yahoo Finance).")
-    elif len(df) < 55:
-        st.warning(f"Za mało danych historycznych ({len(df)} świec) do policzenia wszystkich wskaźników. Spróbuj dłuższy interwał (np. 1d).")
-    else:
-        result = generate_signal(df)
+if not rows:
+    st.info("Dodaj przynajmniej jeden ticker w panelu po lewej.")
+else:
+    df_table = pd.DataFrame(rows)
 
-        # --- Karta z sygnałem ---
+    def color_signal(val):
+        if val == "KUP":
+            return "background-color: #d4f8d4"
+        elif val == "SPRZEDAJ":
+            return "background-color: #f8d4d4"
+        elif val == "BŁĄD":
+            return "background-color: #eeeeee; color: #999999"
+        return "background-color: #fff8d4"
+
+    styled = df_table.style.applymap(color_signal, subset=["Sygnał"])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    st.subheader("Szczegóły instrumentu")
+    valid_tickers = [t for t in tickers if t in results_by_ticker]
+    if valid_tickers:
+        selected = st.selectbox("Wybierz ticker do analizy szczegółowej", valid_tickers)
+        result = results_by_ticker[selected]
+
         signal_color = {"KUP": "🟢", "SPRZEDAJ": "🔴", "CZEKAJ": "🟡"}[result["signal"]]
         c1, c2, c3 = st.columns(3)
         c1.metric("Cena", f"{result['price']:.4f}")
         c2.metric("Sygnał", f"{signal_color} {result['signal']}")
         c3.metric("Punkty", f"{result['score']:+d}")
 
-        st.progress(min(max((result["score"] + 5) / 10, 0), 1))
-
-        # --- Wykres świecowy ---
         plot_df = result["df"].tail(80)
         fig = go.Figure(data=[go.Candlestick(
             x=plot_df.index, open=plot_df["Open"], high=plot_df["High"],
-            low=plot_df["Low"], close=plot_df["Close"], name=ticker,
+            low=plot_df["Low"], close=plot_df["Close"], name=selected,
         )])
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA20"], name="SMA20", line=dict(width=1)))
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA50"], name="SMA50", line=dict(width=1)))
@@ -210,15 +245,7 @@ if analyze and ticker:
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- Uzasadnienie ---
-        st.subheader("Uzasadnienie sygnału")
+        st.markdown("**Uzasadnienie sygnału**")
         icon = {"bull": "🟢", "bear": "🔴", "neutral": "⚪"}
         for category, text, direction in result["reasons"]:
             st.write(f"{icon[direction]} **{category}** — {text}")
-
-        st.caption(
-            f"Próg sygnału: ±{SIGNAL_THRESHOLD} punktów. "
-            "To narzędzie analityczne, nie porada inwestycyjna."
-        )
-elif analyze:
-    st.warning("Wpisz ticker instrumentu.")

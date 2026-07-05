@@ -218,7 +218,10 @@ else:
             return "background-color: #eeeeee; color: #999999"
         return "background-color: #fff8d4"
 
-    styled = df_table.style.applymap(color_signal, subset=["Sygnał"])
+    try:
+        styled = df_table.style.map(color_signal, subset=["Sygnał"])
+    except AttributeError:
+        styled = df_table.style.applymap(color_signal, subset=["Sygnał"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     st.subheader("Szczegóły instrumentu")

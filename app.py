@@ -1,51 +1,28 @@
 """
 ================================================================
-ANALIZATOR SYGNAŁÓW GIEŁDOWYCH / KRYPTO
+APLIKACJA: Analizator Sygnałów Giełdowych
 ================================================================
-Łączy wskaźniki techniczne (RSI, MACD, SMA, Bollinger Bands)
-z formacjami świecowymi, aby generować sygnały BUY / SELL / HOLD.
+Prosta aplikacja webowa (Streamlit) - wpisujesz ticker, klikasz
+"Analizuj", dostajesz sygnał BUY/SELL/HOLD + wykres + uzasadnienie.
 
-Dane: Yahoo Finance (yfinance) - darmowe, bez limitów, obejmuje
-akcje US oraz krypto (format BTC-USD, ETH-USD itd.)
+Uruchomienie:
+    pip3 install streamlit yfinance pandas numpy plotly
+    streamlit run app.py
 
-UWAGA: To narzędzie ANALITYCZNE, nie łączy się z kontem XTB.
-Nie składa żadnych zleceń automatycznie - tylko generuje sygnały.
-Nie jest to porada inwestycyjna.
+Otworzy się w przeglądarce na http://localhost:8501
 ================================================================
 """
 
-import time
-import datetime
-import requests
 import numpy as np
 import pandas as pd
+import streamlit as st
 import yfinance as yf
+import plotly.graph_objects as go
 
-# ============================================================
-# KONFIGURACJA - edytuj tutaj
-# ============================================================
-
-TICKERS = [
-    "AAPL",      # Apple
-    "MSFT",      # Microsoft
-    "NVDA",      # Nvidia
-    "BTC-USD",   # Bitcoin
-    "ETH-USD",   # Ethereum
-]
-
-INTERVAL_MINUTES = 5          # co ile minut sprawdzać rynek
-PERIOD = "60d"                 # ile historii ściągać (max dla świec 15m w yfinance)
-TIMEFRAME = "15m"              # świece 15-minutowe (bardziej "na bieżąco")
-
-# Telegram alerty (opcjonalne) - wpisz swoje dane, albo zostaw puste żeby wyłączyć
-TELEGRAM_BOT_TOKEN = ""       # np. "123456789:AAExxxxxx"
-TELEGRAM_CHAT_ID = ""         # np. "987654321"
-
-# Próg punktowy do wygenerowania sygnału (im wyżej, tym rzadziej i "mocniej" sygnał)
 SIGNAL_THRESHOLD = 3
 
 # ============================================================
-# WSKAŹNIKI TECHNICZNE
+# WSKAŹNIKI (identyczna logika jak w signal_analyzer.py)
 # ============================================================
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -63,16 +40,13 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
     ema_slow = series.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+    return macd_line, signal_line, macd_line - signal_line
 
 
 def bollinger_bands(series: pd.Series, period=20, num_std=2):
     sma = series.rolling(period).mean()
     std = series.rolling(period).std()
-    upper = sma + num_std * std
-    lower = sma - num_std * std
-    return upper, sma, lower
+    return sma + num_std * std, sma, sma - num_std * std
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -85,108 +59,82 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# FORMACJE ŚWIECOWE (proste reguły, bez zewnętrznych bibliotek TA-Lib)
-# ============================================================
-
 def detect_candlestick_patterns(df: pd.DataFrame) -> list:
-    """Zwraca listę wykrytych formacji na podstawie 2 ostatnich świec."""
     patterns = []
     if len(df) < 2:
         return patterns
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
+    last, prev = df.iloc[-1], df.iloc[-2]
     o, h, l, c = last["Open"], last["High"], last["Low"], last["Close"]
-    po, ph, pl, pc = prev["Open"], prev["High"], prev["Low"], prev["Close"]
-
+    po, pc = prev["Open"], prev["Close"]
     body = abs(c - o)
     candle_range = h - l if h != l else 1e-9
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
 
-    # Bullish engulfing
     if pc < po and c > o and c > po and o < pc:
         patterns.append(("bullish_engulfing", "bull"))
-
-    # Bearish engulfing
     if pc > po and c < o and c < po and o > pc:
         patterns.append(("bearish_engulfing", "bear"))
-
-    # Hammer (mały korpus na górze, długi dolny cień, w trendzie spadkowym)
     if lower_wick > body * 2 and upper_wick < body * 0.5 and c > o:
         patterns.append(("hammer", "bull"))
-
-    # Shooting star (mały korpus na dole, długi górny cień)
     if upper_wick > body * 2 and lower_wick < body * 0.5 and c < o:
         patterns.append(("shooting_star", "bear"))
-
-    # Doji (bardzo mały korpus względem zakresu świecy)
     if body < candle_range * 0.1:
         patterns.append(("doji", "neutral"))
-
     return patterns
 
 
-# ============================================================
-# SILNIK SYGNAŁÓW - łączy wskaźniki + formacje w system punktowy
-# ============================================================
-
 def generate_signal(df: pd.DataFrame) -> dict:
     df = add_indicators(df)
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
+    last, prev = df.iloc[-1], df.iloc[-2]
     score = 0
     reasons = []
 
-    # --- RSI ---
     if pd.notna(last["RSI"]):
         if last["RSI"] < 30:
             score += 2
-            reasons.append(f"RSI={last['RSI']:.1f} (wyprzedanie)")
+            reasons.append(("RSI", f"RSI={last['RSI']:.1f} — wyprzedanie (rynek może się odbić w górę)", "bull"))
         elif last["RSI"] > 70:
             score -= 2
-            reasons.append(f"RSI={last['RSI']:.1f} (wykupienie)")
+            reasons.append(("RSI", f"RSI={last['RSI']:.1f} — wykupienie (rynek może skorygować w dół)", "bear"))
+        else:
+            reasons.append(("RSI", f"RSI={last['RSI']:.1f} — strefa neutralna", "neutral"))
 
-    # --- MACD crossover ---
     if pd.notna(last["MACD"]) and pd.notna(prev["MACD"]):
         if prev["MACD"] < prev["MACD_signal"] and last["MACD"] > last["MACD_signal"]:
             score += 2
-            reasons.append("MACD: przecięcie w górę (bull)")
+            reasons.append(("MACD", "Przecięcie linii sygnału w górę — momentum wzrostowe", "bull"))
         elif prev["MACD"] > prev["MACD_signal"] and last["MACD"] < last["MACD_signal"]:
             score -= 2
-            reasons.append("MACD: przecięcie w dół (bear)")
+            reasons.append(("MACD", "Przecięcie linii sygnału w dół — momentum spadkowe", "bear"))
+        else:
+            reasons.append(("MACD", "Brak świeżego przecięcia", "neutral"))
 
-    # --- Trend SMA20/50 ---
     if pd.notna(last["SMA20"]) and pd.notna(last["SMA50"]):
         if last["SMA20"] > last["SMA50"]:
             score += 1
-            reasons.append("Trend: SMA20 > SMA50 (wzrostowy)")
+            reasons.append(("Trend", "SMA20 > SMA50 — trend wzrostowy", "bull"))
         else:
             score -= 1
-            reasons.append("Trend: SMA20 < SMA50 (spadkowy)")
+            reasons.append(("Trend", "SMA20 < SMA50 — trend spadkowy", "bear"))
 
-    # --- Bollinger Bands ---
     if pd.notna(last["BB_lower"]) and last["Close"] < last["BB_lower"]:
         score += 1
-        reasons.append("Cena poniżej dolnej Bollingera (potencjalne odbicie)")
+        reasons.append(("Bollinger", "Cena poniżej dolnej bandy — potencjalne odbicie", "bull"))
     elif pd.notna(last["BB_upper"]) and last["Close"] > last["BB_upper"]:
         score -= 1
-        reasons.append("Cena powyżej górnej Bollingera (potencjalna korekta)")
+        reasons.append(("Bollinger", "Cena powyżej górnej bandy — potencjalna korekta", "bear"))
 
-    # --- Formacje świecowe ---
-    patterns = detect_candlestick_patterns(df)
-    for name, direction in patterns:
+    for name, direction in detect_candlestick_patterns(df):
         if direction == "bull":
             score += 1
-            reasons.append(f"Formacja: {name} (bull)")
+            reasons.append(("Formacja", f"{name} — sygnał bullish", "bull"))
         elif direction == "bear":
             score -= 1
-            reasons.append(f"Formacja: {name} (bear)")
+            reasons.append(("Formacja", f"{name} — sygnał bearish", "bear"))
+        else:
+            reasons.append(("Formacja", f"{name} — niezdecydowanie", "neutral"))
 
-    # --- Klasyfikacja sygnału ---
     if score >= SIGNAL_THRESHOLD:
         signal = "KUP"
     elif score <= -SIGNAL_THRESHOLD:
@@ -194,78 +142,83 @@ def generate_signal(df: pd.DataFrame) -> dict:
     else:
         signal = "CZEKAJ"
 
-    return {
-        "signal": signal,
-        "score": score,
-        "price": round(last["Close"], 2),
-        "reasons": reasons,
-        "time": df.index[-1],
-    }
+    return {"signal": signal, "score": score, "price": last["Close"], "reasons": reasons, "df": df}
 
 
 # ============================================================
-# TELEGRAM ALERT
+# UI
 # ============================================================
 
-def send_telegram_alert(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
-    except Exception as e:
-        print(f"[Telegram] Błąd wysyłki: {e}")
+st.set_page_config(page_title="Analizator Sygnałów", page_icon="📈", layout="centered")
 
+st.title("📈 Analizator Sygnałów Giełdowych")
+st.caption("Wpisz ticker, wybierz interwał i sprawdź sygnał techniczny na żywo.")
 
-# ============================================================
-# GŁÓWNA PĘTLA
-# ============================================================
+col1, col2 = st.columns([2, 1])
+with col1:
+    ticker = st.text_input(
+        "Instrument (ticker)",
+        value="AAPL",
+        placeholder="np. AAPL, BTC-USD, XRP-USD, TSLA, EURUSD=X",
+    ).strip().upper()
+with col2:
+    timeframe = st.selectbox("Interwał świec", ["15m", "1h", "1d"], index=1)
 
-def analyze_ticker(ticker: str) -> dict | None:
-    try:
-        df = yf.download(ticker, period=PERIOD, interval=TIMEFRAME, progress=False, auto_adjust=True)
-        if df.empty or len(df) < 55:
-            print(f"[{ticker}] Za mało danych do analizy.")
-            return None
-        result = generate_signal(df)
-        result["ticker"] = ticker
-        return result
-    except Exception as e:
-        print(f"[{ticker}] Błąd pobierania/analizy: {e}")
-        return None
+period_map = {"15m": "60d", "1h": "180d", "1d": "2y"}
 
+analyze = st.button("🔍 Analizuj", type="primary", use_container_width=True)
 
-def run_once():
-    print(f"\n=== Analiza: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
-    for ticker in TICKERS:
-        result = analyze_ticker(ticker)
-        if result is None:
-            continue
-
-        line = f"{ticker:10s} | Cena: {result['price']:>10} | Sygnał: {result['signal']:5s} | Punkty: {result['score']:+d}"
-        print(line)
-        for r in result["reasons"]:
-            print(f"    - {r}")
-
-        if result["signal"] in ("KUP", "SPRZEDAJ"):
-            msg = (
-                f"🔔 SYGNAŁ: {result['signal']} - {ticker}\n"
-                f"Cena: {result['price']}\n"
-                f"Punkty: {result['score']:+d}\n"
-                f"Powody:\n" + "\n".join(f"- {r}" for r in result["reasons"])
-            )
-            send_telegram_alert(msg)
-
-
-def run_loop():
-    print("Start monitoringu. Ctrl+C aby zatrzymać.")
-    while True:
+if analyze and ticker:
+    with st.spinner(f"Pobieram dane dla {ticker}..."):
         try:
-            run_once()
+            df = yf.download(
+                ticker, period=period_map[timeframe], interval=timeframe,
+                progress=False, auto_adjust=True,
+            )
+            if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+                df.columns = df.columns.get_level_values(0)
         except Exception as e:
-            print(f"Błąd w pętli głównej: {e}")
-        time.sleep(INTERVAL_MINUTES * 60)
+            st.error(f"Błąd pobierania danych: {e}")
+            df = None
 
+    if df is None or df.empty:
+        st.error(f"Nie znaleziono danych dla '{ticker}'. Sprawdź czy ticker jest poprawny (format Yahoo Finance).")
+    elif len(df) < 55:
+        st.warning(f"Za mało danych historycznych ({len(df)} świec) do policzenia wszystkich wskaźników. Spróbuj dłuższy interwał (np. 1d).")
+    else:
+        result = generate_signal(df)
 
-if __name__ == "__main__":
-    run_loop()
+        # --- Karta z sygnałem ---
+        signal_color = {"KUP": "🟢", "SPRZEDAJ": "🔴", "CZEKAJ": "🟡"}[result["signal"]]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Cena", f"{result['price']:.4f}")
+        c2.metric("Sygnał", f"{signal_color} {result['signal']}")
+        c3.metric("Punkty", f"{result['score']:+d}")
+
+        st.progress(min(max((result["score"] + 5) / 10, 0), 1))
+
+        # --- Wykres świecowy ---
+        plot_df = result["df"].tail(80)
+        fig = go.Figure(data=[go.Candlestick(
+            x=plot_df.index, open=plot_df["Open"], high=plot_df["High"],
+            low=plot_df["Low"], close=plot_df["Close"], name=ticker,
+        )])
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA20"], name="SMA20", line=dict(width=1)))
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA50"], name="SMA50", line=dict(width=1)))
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BB_upper"], name="BB górna", line=dict(width=1, dash="dot")))
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BB_lower"], name="BB dolna", line=dict(width=1, dash="dot")))
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # --- Uzasadnienie ---
+        st.subheader("Uzasadnienie sygnału")
+        icon = {"bull": "🟢", "bear": "🔴", "neutral": "⚪"}
+        for category, text, direction in result["reasons"]:
+            st.write(f"{icon[direction]} **{category}** — {text}")
+
+        st.caption(
+            f"Próg sygnału: ±{SIGNAL_THRESHOLD} punktów. "
+            "To narzędzie analityczne, nie porada inwestycyjna."
+        )
+elif analyze:
+    st.warning("Wpisz ticker instrumentu.")

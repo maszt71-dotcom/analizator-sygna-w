@@ -210,98 +210,227 @@ def fetch_and_analyze(query: str, timeframe: str, period: str):
 
 st.set_page_config(page_title="Analizator Sygnałów", page_icon="📈", layout="wide")
 
-st.title("📈 Analizator Sygnałów Giełdowych — Watchlist")
-st.caption("Lista obserwowanych instrumentów, sama się odświeża. Kliknij ticker poniżej, aby zobaczyć szczegóły.")
+st.title("📈 Analizator Sygnałów Giełdowych")
 
-with st.sidebar:
-    st.header("Ustawienia")
-    default_tickers = "Apple\nBitcoin\nDino Polska\nSpotify\nXRP\nLubawa"
-    tickers_input = st.text_area(
-        "Lista instrumentów (jeden na linię) — nazwa firmy albo ticker",
-        value=default_tickers,
-        height=180,
-    )
-    st.caption("Możesz wpisać nazwę firmy (np. 'Dino') albo dokładny ticker (np. 'DNP.WA') — aplikacja sama znajdzie właściwy symbol.")
-    timeframe = st.selectbox("Interwał świec", ["15m", "1h", "1d"], index=1)
-    refresh_seconds = st.number_input(
-        "Auto-odśwież co (sekund)", min_value=15, max_value=3600, value=60, step=15
-    )
-    st.caption("To narzędzie analityczne, nie porada inwestycyjna.")
+# Domyślna lista instrumentów do automatycznego skanowania (Top Sygnałów) - edytowalna w sidebarze
+DEFAULT_UNIVERSE_TEXT = """AAPL
+MSFT
+GOOGL
+AMZN
+NVDA
+META
+TSLA
+JPM
+V
+UNH
+XOM
+JNJ
+WMT
+PG
+MA
+HD
+CVX
+MRK
+ABBV
+KO
+PEP
+COST
+AVGO
+ADBE
+CSCO
+CRM
+NFLX
+AMD
+INTC
+ORCL
+BTC-USD
+ETH-USD
+XRP-USD
+SOL-USD
+ADA-USD
+DOGE-USD
+BNB-USD
+AVAX-USD
+PKN.WA
+PKO.WA
+PZU.WA
+KGH.WA
+CDR.WA
+DNP.WA
+LPP.WA
+ALE.WA
+PGE.WA
+SPL.WA
+LBW.WA
+JSW.WA"""
 
-period_map = {"15m": "60d", "1h": "180d", "1d": "2y"}
-tickers = [t.strip() for t in tickers_input.splitlines() if t.strip()]
+tab1, tab2 = st.tabs(["📋 Moja Watchlista", "🏆 Top Sygnałów"])
 
-st_autorefresh(interval=refresh_seconds * 1000, key="refresh_watchlist")
+with tab1:
+    st.caption("Lista obserwowanych instrumentów, sama się odświeża. Kliknij instrument poniżej, aby zobaczyć szczegóły.")
 
-st.caption(f"Ostatnie odświeżenie danych: {pd.Timestamp.now().strftime('%H:%M:%S')} · odświeża się co {refresh_seconds}s")
+    with st.sidebar:
+        st.header("Ustawienia — Watchlista")
+        default_tickers = "Apple\nBitcoin\nDino Polska\nSpotify\nXRP\nLubawa"
+        tickers_input = st.text_area(
+            "Lista instrumentów (jeden na linię) — nazwa firmy albo ticker",
+            value=default_tickers,
+            height=180,
+        )
+        st.caption("Możesz wpisać nazwę firmy (np. 'Dino') albo dokładny ticker (np. 'DNP.WA') — aplikacja sama znajdzie właściwy symbol.")
+        timeframe = st.selectbox("Interwał świec", ["15m", "1h", "1d"], index=1)
+        refresh_seconds = st.number_input(
+            "Auto-odśwież co (sekund)", min_value=15, max_value=3600, value=60, step=15
+        )
+        st.caption("To narzędzie analityczne, nie porada inwestycyjna.")
 
-rows = []
-results_by_ticker = {}
+    period_map = {"15m": "60d", "1h": "180d", "1d": "2y"}
+    tickers = [t.strip() for t in tickers_input.splitlines() if t.strip()]
 
-with st.spinner("Analizuję listę instrumentów..."):
-    for query in tickers:
+    st_autorefresh(interval=refresh_seconds * 1000, key="refresh_watchlist")
+
+    st.caption(f"Ostatnie odświeżenie danych: {pd.Timestamp.now().strftime('%H:%M:%S')} · odświeża się co {refresh_seconds}s")
+
+    rows = []
+    results_by_ticker = {}
+
+    with st.spinner("Analizuję listę instrumentów..."):
+        for query in tickers:
+            try:
+                result = fetch_and_analyze(query, timeframe, period_map[timeframe])
+            except Exception:
+                result = None
+            if result is None:
+                rows.append({"Wpisano": query, "Ticker": "—", "Cena": None, "Sygnał": "BŁĄD", "Punkty": None})
+                continue
+            results_by_ticker[query] = result
+            rows.append({
+                "Wpisano": query,
+                "Ticker": result["ticker_used"],
+                "Cena": round(result["price"], 4),
+                "Sygnał": result["signal"],
+                "Punkty": result["score"],
+            })
+
+    if not rows:
+        st.info("Dodaj przynajmniej jeden instrument w panelu po lewej.")
+    else:
+        df_table = pd.DataFrame(rows)
+
+        def color_signal(val):
+            if val == "KUP":
+                return "background-color: #d4f8d4"
+            elif val == "SPRZEDAJ":
+                return "background-color: #f8d4d4"
+            elif val == "BŁĄD":
+                return "background-color: #eeeeee; color: #999999"
+            return "background-color: #fff8d4"
+
         try:
-            result = fetch_and_analyze(query, timeframe, period_map[timeframe])
-        except Exception as e:
-            result = None
-        if result is None:
-            rows.append({"Wpisano": query, "Ticker": "—", "Cena": None, "Sygnał": "BŁĄD", "Punkty": None})
-            continue
-        results_by_ticker[query] = result
-        rows.append({
-            "Wpisano": query,
-            "Ticker": result["ticker_used"],
-            "Cena": round(result["price"], 4),
-            "Sygnał": result["signal"],
-            "Punkty": result["score"],
-        })
+            styled = df_table.style.map(color_signal, subset=["Sygnał"])
+        except AttributeError:
+            styled = df_table.style.applymap(color_signal, subset=["Sygnał"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
-if not rows:
-    st.info("Dodaj przynajmniej jeden ticker w panelu po lewej.")
-else:
-    df_table = pd.DataFrame(rows)
+        st.subheader("Szczegóły instrumentu")
+        valid_tickers = [t for t in tickers if t in results_by_ticker]
+        if valid_tickers:
+            selected = st.selectbox("Wybierz instrument do analizy szczegółowej", valid_tickers, key="watchlist_select")
+            result = results_by_ticker[selected]
 
-    def color_signal(val):
-        if val == "KUP":
-            return "background-color: #d4f8d4"
-        elif val == "SPRZEDAJ":
-            return "background-color: #f8d4d4"
-        elif val == "BŁĄD":
-            return "background-color: #eeeeee; color: #999999"
-        return "background-color: #fff8d4"
+            signal_color = {"KUP": "🟢", "SPRZEDAJ": "🔴", "CZEKAJ": "🟡"}[result["signal"]]
+            st.caption(f"Rozpoznano jako: **{result['display_name']}** ({result['ticker_used']})")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Cena", f"{result['price']:.4f}")
+            c2.metric("Sygnał", f"{signal_color} {result['signal']}")
+            c3.metric("Punkty", f"{result['score']:+d}")
 
-    try:
-        styled = df_table.style.map(color_signal, subset=["Sygnał"])
-    except AttributeError:
-        styled = df_table.style.applymap(color_signal, subset=["Sygnał"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+            plot_df = result["df"].tail(80)
+            fig = go.Figure(data=[go.Candlestick(
+                x=plot_df.index, open=plot_df["Open"], high=plot_df["High"],
+                low=plot_df["Low"], close=plot_df["Close"], name=result["ticker_used"],
+            )])
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA20"], name="SMA20", line=dict(width=1)))
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA50"], name="SMA50", line=dict(width=1)))
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BB_upper"], name="BB górna", line=dict(width=1, dash="dot")))
+            fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BB_lower"], name="BB dolna", line=dict(width=1, dash="dot")))
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Szczegóły instrumentu")
-    valid_tickers = [t for t in tickers if t in results_by_ticker]
-    if valid_tickers:
-        selected = st.selectbox("Wybierz instrument do analizy szczegółowej", valid_tickers)
-        result = results_by_ticker[selected]
+            st.markdown("**Uzasadnienie sygnału**")
+            icon = {"bull": "🟢", "bear": "🔴", "neutral": "⚪"}
+            for category, text, direction in result["reasons"]:
+                st.write(f"{icon[direction]} **{category}** — {text}")
 
-        signal_color = {"KUP": "🟢", "SPRZEDAJ": "🔴", "CZEKAJ": "🟡"}[result["signal"]]
-        st.caption(f"Rozpoznano jako: **{result['display_name']}** ({result['ticker_used']})")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Cena", f"{result['price']:.4f}")
-        c2.metric("Sygnał", f"{signal_color} {result['signal']}")
-        c3.metric("Punkty", f"{result['score']:+d}")
 
-        plot_df = result["df"].tail(80)
-        fig = go.Figure(data=[go.Candlestick(
-            x=plot_df.index, open=plot_df["Open"], high=plot_df["High"],
-            low=plot_df["Low"], close=plot_df["Close"], name=result["ticker_used"],
-        )])
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA20"], name="SMA20", line=dict(width=1)))
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA50"], name="SMA50", line=dict(width=1)))
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BB_upper"], name="BB górna", line=dict(width=1, dash="dot")))
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["BB_lower"], name="BB dolna", line=dict(width=1, dash="dot")))
-        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
+with tab2:
+    st.caption(
+        "Automatyczne skanowanie szerokiej listy popularnych instrumentów "
+        "(duże spółki USA, krypto, WIG20) — 10 najbardziej wzrostowych i 10 najbardziej spadkowych sygnałów."
+    )
 
-        st.markdown("**Uzasadnienie sygnału**")
-        icon = {"bull": "🟢", "bear": "🔴", "neutral": "⚪"}
-        for category, text, direction in result["reasons"]:
-            st.write(f"{icon[direction]} **{category}** — {text}")
+    with st.sidebar:
+        st.header("Ustawienia — Top Sygnałów")
+        universe_input = st.text_area(
+            "Lista instrumentów do skanowania (max 50, jeden na linię)",
+            value=DEFAULT_UNIVERSE_TEXT,
+            height=220,
+            key="universe_input",
+        )
+        universe_lines = [t.strip() for t in universe_input.splitlines() if t.strip()]
+        if len(universe_lines) > 50:
+            st.warning(f"Wpisano {len(universe_lines)} pozycji — używam pierwszych 50.")
+            universe_lines = universe_lines[:50]
+        top_timeframe = st.selectbox("Interwał świec (Top Sygnałów)", ["15m", "1h", "1d"], index=1, key="top_timeframe")
+        top_refresh_minutes = st.number_input(
+            "Auto-odśwież co (minut)", min_value=1, max_value=60, value=5, key="top_refresh"
+        )
+        st.caption(f"Skanowane instrumenty: {len(universe_lines)}/50. Dłuższy interwał odświeżania zapobiega blokadom Yahoo Finance.")
+
+    st_autorefresh(interval=top_refresh_minutes * 60 * 1000, key="refresh_top_signals")
+
+    st.caption(f"Ostatni skan: {pd.Timestamp.now().strftime('%H:%M:%S')} · odświeża się co {top_refresh_minutes} min")
+
+    top_period_map = {"15m": "60d", "1h": "180d", "1d": "2y"}
+    scan_results = []
+
+    with st.spinner(f"Skanuję {len(universe_lines)} instrumentów..."):
+        for tkr in universe_lines:
+            try:
+                result = fetch_and_analyze(tkr, top_timeframe, top_period_map[top_timeframe])
+            except Exception:
+                result = None
+            if result is None:
+                continue
+            scan_results.append({
+                "Ticker": result["ticker_used"],
+                "Nazwa": result["display_name"],
+                "Cena": round(result["price"], 4),
+                "Sygnał": result["signal"],
+                "Punkty": result["score"],
+            })
+
+    if not scan_results:
+        st.warning("Nie udało się pobrać danych. Spróbuj ponownie za chwilę (możliwy limit zapytań Yahoo Finance).")
+    else:
+        scan_df = pd.DataFrame(scan_results)
+
+        col_buy, col_sell = st.columns(2)
+
+        with col_buy:
+            st.markdown("### 🟢 Top 10 — najbardziej wzrostowe (KUP)")
+            top_buy = scan_df.sort_values("Punkty", ascending=False).head(10).reset_index(drop=True)
+            top_buy.index = top_buy.index + 1
+            st.dataframe(top_buy, use_container_width=True)
+
+        with col_sell:
+            st.markdown("### 🔴 Top 10 — najbardziej spadkowe (SPRZEDAJ)")
+            top_sell = scan_df.sort_values("Punkty", ascending=True).head(10).reset_index(drop=True)
+            top_sell.index = top_sell.index + 1
+            st.dataframe(top_sell, use_container_width=True)
+
+        st.caption(
+            f"Przeskanowano {len(scan_df)}/{len(universe_lines)} instrumentów. "
+            "Ranking wg punktów: RSI, MACD, trend SMA, Bollinger Bands, formacje świecowe. "
+            "To narzędzie analityczne, nie porada inwestycyjna."
+        )

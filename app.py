@@ -412,9 +412,16 @@ SPL.WA
 LBW.WA
 JSW.WA"""
 
-tab1, tab2, tab3 = st.tabs(["📋 Moja Watchlista", "🏆 Top Sygnałów", "📊 Backtest"])
+st.sidebar.markdown("## 🧭 Wybierz widok")
+mode = st.sidebar.radio(
+    "Widok", ["📋 Moja Watchlista", "🏆 Top Sygnałów", "📊 Backtest"],
+    label_visibility="collapsed",
+)
+st.sidebar.divider()
 
-with tab1:
+st.markdown(f"### {mode}")
+
+if mode == "📋 Moja Watchlista":
     st.caption("Lista obserwowanych instrumentów, sama się odświeża. Kliknij instrument poniżej, aby zobaczyć szczegóły.")
 
     with st.sidebar:
@@ -517,7 +524,7 @@ with tab1:
                 st.write(f"{icon[direction]} **{category}** — {text}")
 
 
-with tab2:
+elif mode == "🏆 Top Sygnałów":
     st.caption(
         "Automatyczne skanowanie szerokiej listy popularnych instrumentów "
         "(duże spółki USA, krypto, WIG20) — 10 najbardziej wzrostowych i 10 najbardziej spadkowych sygnałów."
@@ -592,7 +599,7 @@ with tab2:
         )
 
 
-with tab3:
+elif mode == "📊 Backtest":
     st.caption(
         "Sprawdź, jak sygnały KUP/SPRZEDAJ radziły sobie historycznie na danym instrumencie. "
         "To narzędzie analityczne, nie porada inwestycyjna — wyniki z przeszłości nie gwarantują przyszłych."

@@ -298,7 +298,105 @@ def get_accuracy(ticker: str):
         return None
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_auto_tuned_params(ticker: str):
+    """
+    Automatyczne dopasowanie strategii do konkretnego instrumentu: testuje kilkanaście
+    kombinacji Stop Loss / Take Profit / filtra trendu na 2 latach historii dziennej
+    i zwraca tę, która dała najlepszy łączny wynik. Cache na 24h (żeby nie przeciążać Yahoo).
+    Zwraca dict {"use_trend_filter", "stop_loss_pct", "take_profit_pct", "total_return", "win_rate", "trades"} albo None.
+    """
+    try:
+        df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+        if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+            df.columns = df.columns.get_level_values(0)
+        if df.empty or len(df) < 250:
+            return None
+    except Exception:
+        return None
+
+    best = None
+    for tf_opt in [True, False]:
+        for sl_opt in [5, 8, 12]:
+            for tp_opt in [12, 18, 25]:
+                try:
+                    t_opt, _, _, _ = run_backtest(df, use_trend_filter=tf_opt, stop_loss_pct=sl_opt, take_profit_pct=tp_opt)
+                except Exception:
+                    continue
+                if len(t_opt) < 3:
+                    continue
+                total_ret = ((1 + t_opt["Zwrot %"] / 100).prod() - 1) * 100
+                if best is None or total_ret > best["total_return"]:
+                    best = {
+                        "use_trend_filter": tf_opt,
+                        "stop_loss_pct": sl_opt,
+                        "take_profit_pct": tp_opt,
+                        "total_return": round(total_ret, 1),
+                        "win_rate": round(t_opt["Trafiony"].mean() * 100, 0),
+                        "trades": len(t_opt),
+                    }
+    return best
+
+
 import requests
+
+# Przybliżone przeliczenie okresu (jak w yfinance) na minuty historii wstecz (dla XTB)
+PERIOD_TO_MINUTES = {
+    "60d": 60 * 24 * 60,
+    "180d": 180 * 24 * 60,
+    "730d": 730 * 24 * 60,
+    "2y": 730 * 24 * 60,
+    "5y": 5 * 365 * 24 * 60,
+    "1y": 365 * 24 * 60,
+}
+
+
+def get_dataframe(
+    ticker: str, timeframe: str, period: str, source: str = "Yahoo Finance",
+    xtb_user: str = None, xtb_pass: str = None, xtb_acc_type: str = "demo",
+) -> pd.DataFrame:
+    """
+    Ujednolicone pobieranie świec: Yahoo Finance albo XTB.
+    WAŻNE: wszystkie parametry źródła danych przekazywane explicite (nie przez
+    st.session_state) - bo ta funkcja jest wołana z cache'owanych funkcji, a cache
+    w Streamlit Cloud jest współdzielony między sesjami różnych użytkowników.
+    Brak explicit parametrów w cache key mógłby wymieszać dane różnych użytkowników/źródeł.
+    """
+    if source == "XTB (Twoje konto)":
+        if not xtb_user or not xtb_pass:
+            return pd.DataFrame()
+        try:
+            from xtb_client import XTBClient
+            lookback_minutes = PERIOD_TO_MINUTES.get(period, 60 * 24 * 60)
+            with XTBClient(user_id=xtb_user, password=xtb_pass, account_type=xtb_acc_type) as client:
+                candles = client.get_candles(ticker, timeframe, lookback_minutes)
+            if not candles:
+                return pd.DataFrame()
+            df = pd.DataFrame(candles)
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df = df.set_index("time").rename(columns={
+                "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume",
+            })
+            return df[["Open", "High", "Low", "Close", "Volume"]]
+        except Exception as e:
+            st.error(f"Błąd połączenia z XTB: {e}")
+            return pd.DataFrame()
+
+    # Domyślnie: Yahoo Finance
+    df = yf.download(ticker, period=period, interval=timeframe, progress=False, auto_adjust=True)
+    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def get_current_data_source_params():
+    """Odczytuje ustawienia źródła danych z session_state - wołać TYLKO poza cache'owanymi funkcjami."""
+    return {
+        "source": st.session_state.get("data_source", "Yahoo Finance"),
+        "xtb_user": st.session_state.get("xtb_user"),
+        "xtb_pass": st.session_state.get("xtb_pass"),
+        "xtb_acc_type": st.session_state.get("xtb_acc_type", "demo"),
+    }
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_ticker(query: str):
@@ -326,22 +424,21 @@ def resolve_ticker(query: str):
     return None
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_and_analyze(query: str, timeframe: str, period: str):
-    """Analizuje instrument. Najpierw próbuje wprost jako ticker, potem szuka po nazwie."""
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_and_analyze(
+    query: str, timeframe: str, period: str, source: str = "Yahoo Finance",
+    xtb_user: str = None, xtb_pass: str = None, xtb_acc_type: str = "demo",
+):
+    """Analizuje instrument. Najpierw próbuje wprost jako ticker, potem (tylko dla Yahoo) szuka po nazwie."""
     ticker_used = query.strip().upper()
     display_name = ticker_used
-    df = yf.download(ticker_used, period=period, interval=timeframe, progress=False, auto_adjust=True)
-    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
-        df.columns = df.columns.get_level_values(0)
+    df = get_dataframe(ticker_used, timeframe, period, source, xtb_user, xtb_pass, xtb_acc_type)
 
-    if df.empty or len(df) < 55:
+    if (df.empty or len(df) < 55) and source == "Yahoo Finance":
         resolved = resolve_ticker(query)
         if resolved:
             ticker_used, display_name = resolved
-            df = yf.download(ticker_used, period=period, interval=timeframe, progress=False, auto_adjust=True)
-            if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
-                df.columns = df.columns.get_level_values(0)
+            df = get_dataframe(ticker_used, timeframe, period, source, xtb_user, xtb_pass, xtb_acc_type)
 
     if df.empty or len(df) < 55:
         return None
@@ -361,6 +458,15 @@ st.set_page_config(page_title="Analizator Sygnałów", page_icon="📈", layout=
 st.title("📈 Analizator Sygnałów Giełdowych")
 
 # Domyślna lista instrumentów do automatycznego skanowania (Top Sygnałów) - edytowalna w sidebarze
+def safe_dataframe(df, **kwargs):
+    """Wyświetla DataFrame, a jeśli renderowanie się nie uda (np. problem z typami danych), pokazuje błąd tekstowy zamiast crashować całą aplikację."""
+    try:
+        st.dataframe(df, **kwargs)
+    except Exception as e:
+        st.error(f"Nie udało się wyświetlić tabeli: {e}")
+        st.write(df.to_dict("records"))
+
+
 DEFAULT_UNIVERSE_TEXT = """AAPL
 MSFT
 GOOGL
@@ -412,6 +518,26 @@ SPL.WA
 LBW.WA
 JSW.WA"""
 
+with st.sidebar:
+    st.markdown("## 🔌 Źródło danych")
+    data_source = st.radio(
+        "Źródło danych", ["Yahoo Finance", "XTB (Twoje konto)"],
+        key="data_source", label_visibility="collapsed",
+    )
+    if data_source == "XTB (Twoje konto)":
+        st.caption(
+            "Dane logowania używane tylko w tej sesji przeglądarki, nigdzie nie zapisywane. "
+            "Wpisz numer konta (nie e-mail), zacznij od konta demo."
+        )
+        st.text_input("Numer konta XTB", key="xtb_user")
+        st.text_input("Hasło XTB", type="password", key="xtb_pass")
+        st.selectbox("Typ konta", ["demo", "real"], key="xtb_acc_type")
+        st.caption(
+            "Uwaga: w XTB tickery mają inne nazwy niż w Yahoo Finance "
+            "(np. Bitcoin może być 'BITCOIN' zamiast 'BTC-USD'). Wpisuj dokładne nazwy z platformy XTB."
+        )
+    st.divider()
+
 st.sidebar.markdown("## 🧭 Wybierz widok")
 mode = st.sidebar.radio(
     "Widok", ["📋 Moja Watchlista", "🏆 Top Sygnałów", "📊 Backtest"],
@@ -448,11 +574,12 @@ if mode == "📋 Moja Watchlista":
 
     rows = []
     results_by_ticker = {}
+    ds_params = get_current_data_source_params()
 
     with st.spinner("Analizuję listę instrumentów..."):
         for query in tickers:
             try:
-                result = fetch_and_analyze(query, timeframe, period_map[timeframe])
+                result = fetch_and_analyze(query, timeframe, period_map[timeframe], **ds_params)
             except Exception:
                 result = None
             if result is None:
@@ -466,7 +593,7 @@ if mode == "📋 Moja Watchlista":
                 "Cena": round(result["price"], 4),
                 "Sygnał": result["signal"],
                 "Punkty": result["score"],
-                "Skuteczność %": accuracy if accuracy is not None else "—",
+                "Skuteczność %": f"{accuracy:.0f}%" if accuracy is not None else "—",
             })
 
     if not rows:
@@ -487,7 +614,7 @@ if mode == "📋 Moja Watchlista":
             styled = df_table.style.map(color_signal, subset=["Sygnał"])
         except AttributeError:
             styled = df_table.style.applymap(color_signal, subset=["Sygnał"])
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        safe_dataframe(styled, use_container_width=True, hide_index=True)
         st.caption(
             "Skuteczność % = jak duży odsetek pełnych transakcji (kupno na sygnale KUP, sprzedaż na "
             "kolejnym sygnale SPRZEDAJ) w ostatnim roku zamknął się zyskiem. Historia nie gwarantuje przyszłości."
@@ -523,6 +650,23 @@ if mode == "📋 Moja Watchlista":
             for category, text, direction in result["reasons"]:
                 st.write(f"{icon[direction]} **{category}** — {text}")
 
+            with st.expander("🎯 Auto-dopasowana strategia dla tego instrumentu"):
+                with st.spinner("Dopasowuję parametry na podstawie 2 lat historii..."):
+                    tuned = get_auto_tuned_params(result["ticker_used"])
+                if tuned is None:
+                    st.caption("Za mało historii albo brak rentownej kombinacji dla tego instrumentu w testowanym okresie.")
+                else:
+                    tc1, tc2, tc3 = st.columns(3)
+                    tc1.metric("Zalecany Stop Loss", f"{tuned['stop_loss_pct']:.0f}%")
+                    tc2.metric("Zalecany Take Profit", f"{tuned['take_profit_pct']:.0f}%")
+                    tc3.metric("Filtr trendu (SMA200)", "Tak" if tuned["use_trend_filter"] else "Nie")
+                    st.caption(
+                        f"Na 2 latach historii dziennej: {tuned['trades']} transakcji, "
+                        f"win rate {tuned['win_rate']:.0f}%, zwrot łączny {tuned['total_return']:+.1f}%. "
+                        "To dopasowanie do przeszłości (overfitting) — nie gwarantuje podobnych wyników w przyszłości. "
+                        "Wpisz te wartości ręcznie w zakładce Backtest, jeśli chcesz zobaczyć szczegóły transakcji."
+                    )
+
 
 elif mode == "🏆 Top Sygnałów":
     st.caption(
@@ -544,7 +688,7 @@ elif mode == "🏆 Top Sygnałów":
             universe_lines = universe_lines[:50]
         top_timeframe = st.selectbox("Interwał świec (Top Sygnałów)", ["15m", "1h", "1d"], index=1, key="top_timeframe")
         top_refresh_minutes = st.number_input(
-            "Auto-odśwież co (minut)", min_value=1, max_value=60, value=5, key="top_refresh"
+            "Auto-odśwież co (minut)", min_value=3, max_value=60, value=10, key="top_refresh"
         )
         st.caption(f"Skanowane instrumenty: {len(universe_lines)}/50. Dłuższy interwał odświeżania zapobiega blokadom Yahoo Finance.")
 
@@ -554,23 +698,22 @@ elif mode == "🏆 Top Sygnałów":
 
     top_period_map = {"15m": "60d", "1h": "180d", "1d": "2y"}
     scan_results = []
+    ds_params = get_current_data_source_params()
 
     with st.spinner(f"Skanuję {len(universe_lines)} instrumentów..."):
         for tkr in universe_lines:
             try:
-                result = fetch_and_analyze(tkr, top_timeframe, top_period_map[top_timeframe])
+                result = fetch_and_analyze(tkr, top_timeframe, top_period_map[top_timeframe], **ds_params)
             except Exception:
                 result = None
             if result is None:
                 continue
-            accuracy = get_accuracy(result["ticker_used"])
             scan_results.append({
                 "Ticker": result["ticker_used"],
                 "Nazwa": result["display_name"],
                 "Cena": round(result["price"], 4),
                 "Sygnał": result["signal"],
                 "Punkty": result["score"],
-                "Skuteczność %": accuracy if accuracy is not None else "—",
             })
 
     if not scan_results:
@@ -583,14 +726,20 @@ elif mode == "🏆 Top Sygnałów":
         with col_buy:
             st.markdown("### 🟢 Top 10 — najbardziej wzrostowe (KUP)")
             top_buy = scan_df.sort_values("Punkty", ascending=False).head(10).reset_index(drop=True)
+            top_buy["Skuteczność %"] = top_buy["Ticker"].apply(
+                lambda t: (lambda a: f"{a:.0f}%" if a is not None else "—")(get_accuracy(t))
+            )
             top_buy.index = top_buy.index + 1
-            st.dataframe(top_buy, use_container_width=True)
+            safe_dataframe(top_buy, use_container_width=True)
 
         with col_sell:
             st.markdown("### 🔴 Top 10 — najbardziej spadkowe (SPRZEDAJ)")
             top_sell = scan_df.sort_values("Punkty", ascending=True).head(10).reset_index(drop=True)
+            top_sell["Skuteczność %"] = top_sell["Ticker"].apply(
+                lambda t: (lambda a: f"{a:.0f}%" if a is not None else "—")(get_accuracy(t))
+            )
             top_sell.index = top_sell.index + 1
-            st.dataframe(top_sell, use_container_width=True)
+            safe_dataframe(top_sell, use_container_width=True)
 
         st.caption(
             f"Przeskanowano {len(scan_df)}/{len(universe_lines)} instrumentów. "
@@ -627,26 +776,17 @@ elif mode == "📊 Backtest":
         run_bt = st.button("▶️ Uruchom backtest", type="primary", use_container_width=True)
 
     if run_bt and bt_query:
+        ds_params = get_current_data_source_params()
         with st.spinner(f"Pobieram historię i liczę sygnały dla '{bt_query}'..."):
             ticker_bt = bt_query.strip().upper()
-            df_bt = yf.download(
-                ticker_bt, period=bt_period_map[bt_timeframe], interval=bt_timeframe,
-                progress=False, auto_adjust=True,
-            )
-            if hasattr(df_bt.columns, "nlevels") and df_bt.columns.nlevels > 1:
-                df_bt.columns = df_bt.columns.get_level_values(0)
+            df_bt = get_dataframe(ticker_bt, bt_timeframe, bt_period_map[bt_timeframe], **ds_params)
 
             display_name_bt = ticker_bt
-            if df_bt.empty or len(df_bt) < 60:
+            if (df_bt.empty or len(df_bt) < 60) and ds_params["source"] == "Yahoo Finance":
                 resolved = resolve_ticker(bt_query)
                 if resolved:
                     ticker_bt, display_name_bt = resolved
-                    df_bt = yf.download(
-                        ticker_bt, period=bt_period_map[bt_timeframe], interval=bt_timeframe,
-                        progress=False, auto_adjust=True,
-                    )
-                    if hasattr(df_bt.columns, "nlevels") and df_bt.columns.nlevels > 1:
-                        df_bt.columns = df_bt.columns.get_level_values(0)
+                    df_bt = get_dataframe(ticker_bt, bt_timeframe, bt_period_map[bt_timeframe], **ds_params)
 
     if "bt_data" in st.session_state:
         df_bt = st.session_state["bt_data"]["df"]

@@ -123,16 +123,22 @@ def generate_signal(df: pd.DataFrame) -> dict:
     elif pd.notna(last["BB_upper"]) and last["Close"] > last["BB_upper"]:
         score -= 1
         reasons.append(("Bollinger", "Cena powyżej górnej bandy — potencjalna korekta", "bear"))
+    else:
+        reasons.append(("Bollinger", "Cena w normalnym zakresie (między bandami)", "neutral"))
 
-    for name, direction in detect_candlestick_patterns(df):
-        if direction == "bull":
-            score += 1
-            reasons.append(("Formacja", f"{name} — sygnał bullish", "bull"))
-        elif direction == "bear":
-            score -= 1
-            reasons.append(("Formacja", f"{name} — sygnał bearish", "bear"))
-        else:
-            reasons.append(("Formacja", f"{name} — niezdecydowanie", "neutral"))
+    patterns = detect_candlestick_patterns(df)
+    if patterns:
+        for name, direction in patterns:
+            if direction == "bull":
+                score += 1
+                reasons.append(("Formacja", f"{name} — sygnał bullish", "bull"))
+            elif direction == "bear":
+                score -= 1
+                reasons.append(("Formacja", f"{name} — sygnał bearish", "bear"))
+            else:
+                reasons.append(("Formacja", f"{name} — niezdecydowanie", "neutral"))
+    else:
+        reasons.append(("Formacja", "Brak rozpoznanej formacji świecowej", "neutral"))
 
     if score >= SIGNAL_THRESHOLD:
         signal = "KUP"

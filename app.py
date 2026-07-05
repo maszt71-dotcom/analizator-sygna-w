@@ -641,126 +641,128 @@ with tab3:
                     if hasattr(df_bt.columns, "nlevels") and df_bt.columns.nlevels > 1:
                         df_bt.columns = df_bt.columns.get_level_values(0)
 
-        if df_bt.empty or len(df_bt) < 60:
-            st.error(f"Nie znaleziono wystarczających danych dla '{bt_query}'.")
+    if "bt_data" in st.session_state:
+        df_bt = st.session_state["bt_data"]["df"]
+        ticker_bt = st.session_state["bt_data"]["ticker"]
+        display_name_bt = st.session_state["bt_data"]["display_name"]
+
+        trades, still_open, open_entry_date, open_entry_price = run_backtest(
+            df_bt,
+            use_trend_filter=use_trend_filter,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+        )
+
+        if trades.empty:
+            st.warning(
+                f"W historii '{display_name_bt}' ({ticker_bt}) nie wystąpił żaden kompletny cykl "
+                f"KUP→SPRZEDAJ (próg ±{SIGNAL_THRESHOLD} punktów) w analizowanym okresie."
+            )
         else:
-            trades, still_open, open_entry_date, open_entry_price = run_backtest(
-                df_bt,
-                use_trend_filter=use_trend_filter,
-                stop_loss_pct=stop_loss_pct,
-                take_profit_pct=take_profit_pct,
+            st.subheader(f"Wyniki backtestu — {display_name_bt} ({ticker_bt})")
+            st.caption(
+                f"Okres: {df_bt.index[0].strftime('%Y-%m-%d')} do {df_bt.index[-1].strftime('%Y-%m-%d')} · "
+                f"{len(trades)} kompletnych transakcji · świece {st.session_state['bt_data']['timeframe']}"
             )
 
-            if trades.empty:
-                st.warning(
-                    f"W historii '{display_name_bt}' ({ticker_bt}) nie wystąpił żaden kompletny cykl "
-                    f"KUP→SPRZEDAJ (próg ±{SIGNAL_THRESHOLD} punktów) w analizowanym okresie."
+            win_rate = trades["Trafiony"].mean() * 100
+            avg_return = trades["Zwrot %"].mean()
+            avg_days = trades["Dni w pozycji"].mean()
+            total_return = ((1 + trades["Zwrot %"] / 100).prod() - 1) * 100
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Liczba transakcji", len(trades))
+            c2.metric("Win rate", f"{win_rate:.0f}%")
+            c3.metric("Śr. zwrot / transakcję", f"{avg_return:+.2f}%")
+            c4.metric("Śr. dni w pozycji", f"{avg_days:.0f}")
+
+            st.metric(
+                "Zwrot łączny (składany, wszystkie transakcje po sobie)",
+                f"{total_return:+.1f}%",
+            )
+
+            exit_counts = trades["Wyjście"].value_counts()
+            exit_summary = " · ".join(f"{k}: {v}" for k, v in exit_counts.items())
+            st.caption(f"Powody wyjścia z pozycji — {exit_summary}")
+
+            if still_open:
+                st.info(
+                    f"Otwarta pozycja bez sygnału wyjścia: KUP z dnia {open_entry_date.strftime('%Y-%m-%d')} "
+                    f"po cenie {open_entry_price:.4f} — wciąż aktywna (nie liczona w statystykach powyżej)."
                 )
+
+            fig_bt = go.Figure()
+            fig_bt.add_trace(go.Scatter(
+                x=df_bt.index, y=df_bt["Close"], name="Cena", line=dict(color="lightgray", width=1)
+            ))
+            fig_bt.add_trace(go.Scatter(
+                x=trades["Data kupna"], y=trades["Cena kupna"], mode="markers",
+                name="KUP", marker=dict(color="green", size=9, symbol="triangle-up"),
+            ))
+            fig_bt.add_trace(go.Scatter(
+                x=trades["Data sprzedaży"], y=trades["Cena sprzedaży"], mode="markers",
+                name="SPRZEDAJ", marker=dict(color="red", size=9, symbol="triangle-down"),
+            ))
+            fig_bt.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_bt, use_container_width=True)
+
+            st.markdown("**Historia transakcji**")
+            st.dataframe(
+                trades.sort_values("Data kupna", ascending=False).reset_index(drop=True),
+                use_container_width=True, hide_index=True,
+            )
+
+            st.caption(
+                "Win rate = % transakcji zamknięte z zyskiem. Każda transakcja to pełny cykl: "
+                "kupno na sygnale KUP, sprzedaż na najbliższym kolejnym sygnale SPRZEDAJ. "
+                "Wyniki historyczne nie gwarantują przyszłych rezultatów. To narzędzie analityczne, nie porada inwestycyjna."
+            )
+
+        st.divider()
+        st.markdown("### 🔧 Automatyczna optymalizacja parametrów")
+        st.caption(
+            "Przetestuje ~40 kombinacji Stop Loss / Take Profit / filtra trendu na historii tego instrumentu "
+            "i pokaże, które dały najlepszy łączny wynik. Uwaga: to dopasowanie do przeszłości (overfitting) — "
+            "najlepsza kombinacja z historii nie musi być najlepsza w przyszłości."
+        )
+        if st.button("Znajdź najlepsze ustawienia dla tego instrumentu", key="opt_btn"):
+            with st.spinner("Testuję kombinacje..."):
+                combos = []
+                for tf_opt in [True, False]:
+                    for sl_opt in [4, 6, 8, 12, 16]:
+                        for tp_opt in [10, 15, 20, 30]:
+                            t_opt, _, _, _ = run_backtest(
+                                df_bt, use_trend_filter=tf_opt,
+                                stop_loss_pct=sl_opt, take_profit_pct=tp_opt,
+                            )
+                            if len(t_opt) == 0:
+                                continue
+                            total_ret_opt = ((1 + t_opt["Zwrot %"] / 100).prod() - 1) * 100
+                            combos.append({
+                                "Filtr trendu": "Tak" if tf_opt else "Nie",
+                                "Stop Loss %": sl_opt,
+                                "Take Profit %": tp_opt,
+                                "Transakcje": len(t_opt),
+                                "Win rate %": round(t_opt["Trafiony"].mean() * 100, 0),
+                                "Zwrot łączny %": round(total_ret_opt, 1),
+                            })
+
+            if not combos:
+                st.warning("Żadna kombinacja nie wygenerowała transakcji w tym okresie.")
             else:
-                st.subheader(f"Wyniki backtestu — {display_name_bt} ({ticker_bt})")
-                st.caption(
-                    f"Okres: {df_bt.index[0].strftime('%Y-%m-%d')} do {df_bt.index[-1].strftime('%Y-%m-%d')} · "
-                    f"{len(trades)} kompletnych transakcji · świece {bt_timeframe}"
-                )
-
-                win_rate = trades["Trafiony"].mean() * 100
-                avg_return = trades["Zwrot %"].mean()
-                avg_days = trades["Dni w pozycji"].mean()
-                total_return = ((1 + trades["Zwrot %"] / 100).prod() - 1) * 100
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Liczba transakcji", len(trades))
-                c2.metric("Win rate", f"{win_rate:.0f}%")
-                c3.metric("Śr. zwrot / transakcję", f"{avg_return:+.2f}%")
-                c4.metric("Śr. dni w pozycji", f"{avg_days:.0f}")
-
-                st.metric(
-                    "Zwrot łączny (składany, wszystkie transakcje po sobie)",
-                    f"{total_return:+.1f}%",
-                )
-
-                exit_counts = trades["Wyjście"].value_counts()
-                exit_summary = " · ".join(f"{k}: {v}" for k, v in exit_counts.items())
-                st.caption(f"Powody wyjścia z pozycji — {exit_summary}")
-
-                if still_open:
-                    st.info(
-                        f"Otwarta pozycja bez sygnału wyjścia: KUP z dnia {open_entry_date.strftime('%Y-%m-%d')} "
-                        f"po cenie {open_entry_price:.4f} — wciąż aktywna (nie liczona w statystykach powyżej)."
-                    )
-
-                fig_bt = go.Figure()
-                fig_bt.add_trace(go.Scatter(
-                    x=df_bt.index, y=df_bt["Close"], name="Cena", line=dict(color="lightgray", width=1)
-                ))
-                fig_bt.add_trace(go.Scatter(
-                    x=trades["Data kupna"], y=trades["Cena kupna"], mode="markers",
-                    name="KUP", marker=dict(color="green", size=9, symbol="triangle-up"),
-                ))
-                fig_bt.add_trace(go.Scatter(
-                    x=trades["Data sprzedaży"], y=trades["Cena sprzedaży"], mode="markers",
-                    name="SPRZEDAJ", marker=dict(color="red", size=9, symbol="triangle-down"),
-                ))
-                fig_bt.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10))
-                st.plotly_chart(fig_bt, use_container_width=True)
-
-                st.markdown("**Historia transakcji**")
+                combos_df = pd.DataFrame(combos).sort_values("Zwrot łączny %", ascending=False)
                 st.dataframe(
-                    trades.sort_values("Data kupna", ascending=False).reset_index(drop=True),
+                    combos_df.head(15).reset_index(drop=True),
                     use_container_width=True, hide_index=True,
                 )
-
-                st.caption(
-                    "Win rate = % transakcji zamknięte z zyskiem. Każda transakcja to pełny cykl: "
-                    "kupno na sygnale KUP, sprzedaż na najbliższym kolejnym sygnale SPRZEDAJ. "
-                    "Wyniki historyczne nie gwarantują przyszłych rezultatów. To narzędzie analityczne, nie porada inwestycyjna."
+                best = combos_df.iloc[0]
+                st.success(
+                    f"Najlepsza znaleziona kombinacja: Stop Loss {best['Stop Loss %']:.0f}%, "
+                    f"Take Profit {best['Take Profit %']:.0f}%, filtr trendu: {best['Filtr trendu']} "
+                    f"→ {best['Transakcje']:.0f} transakcji, win rate {best['Win rate %']:.0f}%, "
+                    f"zwrot łączny {best['Zwrot łączny %']:+.1f}%. "
+                    f"Wpisz te wartości w panelu po lewej i kliknij 'Uruchom backtest' ponownie, "
+                    f"żeby zobaczyć szczegóły."
                 )
-
-            st.divider()
-            st.markdown("### 🔧 Automatyczna optymalizacja parametrów")
-            st.caption(
-                "Przetestuje ~40 kombinacji Stop Loss / Take Profit / filtra trendu na historii tego instrumentu "
-                "i pokaże, które dały najlepszy łączny wynik. Uwaga: to dopasowanie do przeszłości (overfitting) — "
-                "najlepsza kombinacja z historii nie musi być najlepsza w przyszłości."
-            )
-            if st.button("Znajdź najlepsze ustawienia dla tego instrumentu", key="opt_btn"):
-                with st.spinner("Testuję kombinacje..."):
-                    combos = []
-                    for tf_opt in [True, False]:
-                        for sl_opt in [4, 6, 8, 12, 16]:
-                            for tp_opt in [10, 15, 20, 30]:
-                                t_opt, _, _, _ = run_backtest(
-                                    df_bt, use_trend_filter=tf_opt,
-                                    stop_loss_pct=sl_opt, take_profit_pct=tp_opt,
-                                )
-                                if len(t_opt) == 0:
-                                    continue
-                                total_ret_opt = ((1 + t_opt["Zwrot %"] / 100).prod() - 1) * 100
-                                combos.append({
-                                    "Filtr trendu": "Tak" if tf_opt else "Nie",
-                                    "Stop Loss %": sl_opt,
-                                    "Take Profit %": tp_opt,
-                                    "Transakcje": len(t_opt),
-                                    "Win rate %": round(t_opt["Trafiony"].mean() * 100, 0),
-                                    "Zwrot łączny %": round(total_ret_opt, 1),
-                                })
-
-                if not combos:
-                    st.warning("Żadna kombinacja nie wygenerowała transakcji w tym okresie.")
-                else:
-                    combos_df = pd.DataFrame(combos).sort_values("Zwrot łączny %", ascending=False)
-                    st.dataframe(
-                        combos_df.head(15).reset_index(drop=True),
-                        use_container_width=True, hide_index=True,
-                    )
-                    best = combos_df.iloc[0]
-                    st.success(
-                        f"Najlepsza znaleziona kombinacja: Stop Loss {best['Stop Loss %']:.0f}%, "
-                        f"Take Profit {best['Take Profit %']:.0f}%, filtr trendu: {best['Filtr trendu']} "
-                        f"→ {best['Transakcje']:.0f} transakcji, win rate {best['Win rate %']:.0f}%, "
-                        f"zwrot łączny {best['Zwrot łączny %']:+.1f}%. "
-                        f"Wpisz te wartości w panelu po lewej i kliknij 'Uruchom backtest' ponownie, "
-                        f"żeby zobaczyć szczegóły."
-                    )
-    elif not bt_query:
+    else:
         st.info("Wpisz instrument w panelu po lewej i kliknij 'Uruchom backtest'.")

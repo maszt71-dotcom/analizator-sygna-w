@@ -150,6 +150,95 @@ def generate_signal(df: pd.DataFrame) -> dict:
     return {"signal": signal, "score": score, "price": last["Close"], "reasons": reasons, "df": df}
 
 
+def run_backtest(df: pd.DataFrame):
+    """
+    Symuluje realne transakcje wg naszej strategii: wejście na sygnale KUP,
+    wyjście na najbliższym kolejnym sygnale SPRZEDAJ (bez zaglądania w przyszłość).
+    Zwraca (tabela_transakcji, czy_pozycja_wciąż_otwarta, data_wejścia_otwartej_pozycji).
+    """
+    df_ind = add_indicators(df)
+    trades = []
+    in_position = False
+    entry_price = None
+    entry_date = None
+
+    for i in range(55, len(df_ind)):
+        last = df_ind.iloc[i]
+        prev = df_ind.iloc[i - 1]
+        score = 0
+
+        if pd.notna(last["RSI"]):
+            if last["RSI"] < 30:
+                score += 2
+            elif last["RSI"] > 70:
+                score -= 2
+
+        if pd.notna(last["MACD"]) and pd.notna(prev["MACD"]):
+            if prev["MACD"] < prev["MACD_signal"] and last["MACD"] > last["MACD_signal"]:
+                score += 2
+            elif prev["MACD"] > prev["MACD_signal"] and last["MACD"] < last["MACD_signal"]:
+                score -= 2
+
+        if pd.notna(last["SMA20"]) and pd.notna(last["SMA50"]):
+            score += 1 if last["SMA20"] > last["SMA50"] else -1
+
+        if pd.notna(last["BB_lower"]) and last["Close"] < last["BB_lower"]:
+            score += 1
+        elif pd.notna(last["BB_upper"]) and last["Close"] > last["BB_upper"]:
+            score -= 1
+
+        for name, direction in detect_candlestick_patterns(df_ind.iloc[i - 1:i + 1]):
+            if direction == "bull":
+                score += 1
+            elif direction == "bear":
+                score -= 1
+
+        if score >= SIGNAL_THRESHOLD:
+            signal = "KUP"
+        elif score <= -SIGNAL_THRESHOLD:
+            signal = "SPRZEDAJ"
+        else:
+            signal = "CZEKAJ"
+
+        if signal == "KUP" and not in_position:
+            in_position = True
+            entry_price = last["Close"]
+            entry_date = df_ind.index[i]
+        elif signal == "SPRZEDAJ" and in_position:
+            exit_price = last["Close"]
+            exit_date = df_ind.index[i]
+            ret_pct = (exit_price - entry_price) / entry_price * 100
+            trades.append({
+                "Data kupna": entry_date,
+                "Cena kupna": round(entry_price, 4),
+                "Data sprzedaży": exit_date,
+                "Cena sprzedaży": round(exit_price, 4),
+                "Dni w pozycji": (exit_date - entry_date).days,
+                "Zwrot %": round(ret_pct, 2),
+                "Trafiony": ret_pct > 0,
+            })
+            in_position = False
+
+    return pd.DataFrame(trades), in_position, entry_date, entry_price
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_accuracy(ticker: str):
+    """Szybki backtest w tle (transakcje KUP->SPRZEDAJ z ostatniego roku) - zwraca % trafionych transakcji."""
+    try:
+        df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
+        if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+            df.columns = df.columns.get_level_values(0)
+        if df.empty or len(df) < 60:
+            return None
+        trades, _, _, _ = run_backtest(df)
+        if trades.empty:
+            return None
+        return round(trades["Trafiony"].mean() * 100, 0)
+    except Exception:
+        return None
+
+
 import requests
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -264,7 +353,7 @@ SPL.WA
 LBW.WA
 JSW.WA"""
 
-tab1, tab2 = st.tabs(["📋 Moja Watchlista", "🏆 Top Sygnałów"])
+tab1, tab2, tab3 = st.tabs(["📋 Moja Watchlista", "🏆 Top Sygnałów", "📊 Backtest"])
 
 with tab1:
     st.caption("Lista obserwowanych instrumentów, sama się odświeża. Kliknij instrument poniżej, aby zobaczyć szczegóły.")
@@ -304,12 +393,14 @@ with tab1:
                 rows.append({"Wpisano": query, "Ticker": "—", "Cena": None, "Sygnał": "BŁĄD", "Punkty": None})
                 continue
             results_by_ticker[query] = result
+            accuracy = get_accuracy(result["ticker_used"])
             rows.append({
                 "Wpisano": query,
                 "Ticker": result["ticker_used"],
                 "Cena": round(result["price"], 4),
                 "Sygnał": result["signal"],
                 "Punkty": result["score"],
+                "Skuteczność %": accuracy if accuracy is not None else "—",
             })
 
     if not rows:
@@ -331,6 +422,10 @@ with tab1:
         except AttributeError:
             styled = df_table.style.applymap(color_signal, subset=["Sygnał"])
         st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.caption(
+            "Skuteczność % = jak duży odsetek pełnych transakcji (kupno na sygnale KUP, sprzedaż na "
+            "kolejnym sygnale SPRZEDAJ) w ostatnim roku zamknął się zyskiem. Historia nie gwarantuje przyszłości."
+        )
 
         st.subheader("Szczegóły instrumentu")
         valid_tickers = [t for t in tickers if t in results_by_ticker]
@@ -402,12 +497,14 @@ with tab2:
                 result = None
             if result is None:
                 continue
+            accuracy = get_accuracy(result["ticker_used"])
             scan_results.append({
                 "Ticker": result["ticker_used"],
                 "Nazwa": result["display_name"],
                 "Cena": round(result["price"], 4),
                 "Sygnał": result["signal"],
                 "Punkty": result["score"],
+                "Skuteczność %": accuracy if accuracy is not None else "—",
             })
 
     if not scan_results:
@@ -434,3 +531,108 @@ with tab2:
             "Ranking wg punktów: RSI, MACD, trend SMA, Bollinger Bands, formacje świecowe. "
             "To narzędzie analityczne, nie porada inwestycyjna."
         )
+
+
+with tab3:
+    st.caption(
+        "Sprawdź, jak sygnały KUP/SPRZEDAJ radziły sobie historycznie na danym instrumencie. "
+        "To narzędzie analityczne, nie porada inwestycyjna — wyniki z przeszłości nie gwarantują przyszłych."
+    )
+
+    with st.sidebar:
+        st.header("Ustawienia — Backtest")
+        bt_query = st.text_input("Instrument (nazwa firmy albo ticker)", value="AAPL", key="bt_query")
+        bt_timeframe = st.selectbox("Interwał świec", ["1h", "1d"], index=1, key="bt_timeframe")
+        bt_period_map = {"1h": "730d", "1d": "5y"}
+        st.caption("Symulacja: wejście na sygnale KUP, wyjście na najbliższym kolejnym sygnale SPRZEDAJ.")
+        run_bt = st.button("▶️ Uruchom backtest", type="primary", use_container_width=True)
+
+    if run_bt and bt_query:
+        with st.spinner(f"Pobieram historię i liczę sygnały dla '{bt_query}'..."):
+            ticker_bt = bt_query.strip().upper()
+            df_bt = yf.download(
+                ticker_bt, period=bt_period_map[bt_timeframe], interval=bt_timeframe,
+                progress=False, auto_adjust=True,
+            )
+            if hasattr(df_bt.columns, "nlevels") and df_bt.columns.nlevels > 1:
+                df_bt.columns = df_bt.columns.get_level_values(0)
+
+            display_name_bt = ticker_bt
+            if df_bt.empty or len(df_bt) < 60:
+                resolved = resolve_ticker(bt_query)
+                if resolved:
+                    ticker_bt, display_name_bt = resolved
+                    df_bt = yf.download(
+                        ticker_bt, period=bt_period_map[bt_timeframe], interval=bt_timeframe,
+                        progress=False, auto_adjust=True,
+                    )
+                    if hasattr(df_bt.columns, "nlevels") and df_bt.columns.nlevels > 1:
+                        df_bt.columns = df_bt.columns.get_level_values(0)
+
+        if df_bt.empty or len(df_bt) < 60:
+            st.error(f"Nie znaleziono wystarczających danych dla '{bt_query}'.")
+        else:
+            trades, still_open, open_entry_date, open_entry_price = run_backtest(df_bt)
+
+            if trades.empty:
+                st.warning(
+                    f"W historii '{display_name_bt}' ({ticker_bt}) nie wystąpił żaden kompletny cykl "
+                    f"KUP→SPRZEDAJ (próg ±{SIGNAL_THRESHOLD} punktów) w analizowanym okresie."
+                )
+            else:
+                st.subheader(f"Wyniki backtestu — {display_name_bt} ({ticker_bt})")
+                st.caption(
+                    f"Okres: {df_bt.index[0].strftime('%Y-%m-%d')} do {df_bt.index[-1].strftime('%Y-%m-%d')} · "
+                    f"{len(trades)} kompletnych transakcji · świece {bt_timeframe}"
+                )
+
+                win_rate = trades["Trafiony"].mean() * 100
+                avg_return = trades["Zwrot %"].mean()
+                avg_days = trades["Dni w pozycji"].mean()
+                total_return = ((1 + trades["Zwrot %"] / 100).prod() - 1) * 100
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Liczba transakcji", len(trades))
+                c2.metric("Win rate", f"{win_rate:.0f}%")
+                c3.metric("Śr. zwrot / transakcję", f"{avg_return:+.2f}%")
+                c4.metric("Śr. dni w pozycji", f"{avg_days:.0f}")
+
+                st.metric(
+                    "Zwrot łączny (składany, wszystkie transakcje po sobie)",
+                    f"{total_return:+.1f}%",
+                )
+
+                if still_open:
+                    st.info(
+                        f"Otwarta pozycja bez sygnału wyjścia: KUP z dnia {open_entry_date.strftime('%Y-%m-%d')} "
+                        f"po cenie {open_entry_price:.4f} — wciąż aktywna (nie liczona w statystykach powyżej)."
+                    )
+
+                fig_bt = go.Figure()
+                fig_bt.add_trace(go.Scatter(
+                    x=df_bt.index, y=df_bt["Close"], name="Cena", line=dict(color="lightgray", width=1)
+                ))
+                fig_bt.add_trace(go.Scatter(
+                    x=trades["Data kupna"], y=trades["Cena kupna"], mode="markers",
+                    name="KUP", marker=dict(color="green", size=9, symbol="triangle-up"),
+                ))
+                fig_bt.add_trace(go.Scatter(
+                    x=trades["Data sprzedaży"], y=trades["Cena sprzedaży"], mode="markers",
+                    name="SPRZEDAJ", marker=dict(color="red", size=9, symbol="triangle-down"),
+                ))
+                fig_bt.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10))
+                st.plotly_chart(fig_bt, use_container_width=True)
+
+                st.markdown("**Historia transakcji**")
+                st.dataframe(
+                    trades.sort_values("Data kupna", ascending=False).reset_index(drop=True),
+                    use_container_width=True, hide_index=True,
+                )
+
+                st.caption(
+                    "Win rate = % transakcji zamknięte z zyskiem. Każda transakcja to pełny cykl: "
+                    "kupno na sygnale KUP, sprzedaż na najbliższym kolejnym sygnale SPRZEDAJ. "
+                    "Wyniki historyczne nie gwarantują przyszłych rezultatów. To narzędzie analityczne, nie porada inwestycyjna."
+                )
+    elif not bt_query:
+        st.info("Wpisz instrument w panelu po lewej i kliknij 'Uruchom backtest'.")

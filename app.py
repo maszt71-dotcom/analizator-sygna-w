@@ -144,14 +144,58 @@ def generate_signal(df: pd.DataFrame) -> dict:
     return {"signal": signal, "score": score, "price": last["Close"], "reasons": reasons, "df": df}
 
 
+import requests
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_ticker(query: str):
+    """Próbuje znaleźć ticker na podstawie nazwy firmy/instrumentu przez wyszukiwarkę Yahoo Finance."""
+    query = query.strip()
+    if not query:
+        return None
+    try:
+        resp = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={"q": query, "quotesCount": 5, "newsCount": 0},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=6,
+        )
+        data = resp.json()
+        quotes = data.get("quotes", [])
+        preferred_types = ("EQUITY", "CRYPTOCURRENCY", "ETF", "INDEX", "CURRENCY")
+        for q in quotes:
+            if q.get("quoteType") in preferred_types and q.get("symbol"):
+                return q["symbol"], q.get("shortname") or q.get("longname") or q["symbol"]
+        if quotes and quotes[0].get("symbol"):
+            return quotes[0]["symbol"], quotes[0].get("shortname") or quotes[0]["symbol"]
+    except Exception:
+        pass
+    return None
+
+
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_and_analyze(ticker: str, timeframe: str, period: str):
-    df = yf.download(ticker, period=period, interval=timeframe, progress=False, auto_adjust=True)
+def fetch_and_analyze(query: str, timeframe: str, period: str):
+    """Analizuje instrument. Najpierw próbuje wprost jako ticker, potem szuka po nazwie."""
+    ticker_used = query.strip().upper()
+    display_name = ticker_used
+    df = yf.download(ticker_used, period=period, interval=timeframe, progress=False, auto_adjust=True)
     if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
         df.columns = df.columns.get_level_values(0)
+
+    if df.empty or len(df) < 55:
+        resolved = resolve_ticker(query)
+        if resolved:
+            ticker_used, display_name = resolved
+            df = yf.download(ticker_used, period=period, interval=timeframe, progress=False, auto_adjust=True)
+            if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+                df.columns = df.columns.get_level_values(0)
+
     if df.empty or len(df) < 55:
         return None
-    return generate_signal(df)
+
+    result = generate_signal(df)
+    result["ticker_used"] = ticker_used
+    result["display_name"] = display_name
+    return result
 
 
 # ============================================================
@@ -165,12 +209,13 @@ st.caption("Lista obserwowanych instrumentów, sama się odświeża. Kliknij tic
 
 with st.sidebar:
     st.header("Ustawienia")
-    default_tickers = "AAPL\nMSFT\nNVDA\nBTC-USD\nETH-USD\nXRP-USD\nLBW.WA"
+    default_tickers = "Apple\nBitcoin\nDino Polska\nSpotify\nXRP\nLubawa"
     tickers_input = st.text_area(
-        "Lista tickerów (jeden na linię)",
+        "Lista instrumentów (jeden na linię) — nazwa firmy albo ticker",
         value=default_tickers,
         height=180,
     )
+    st.caption("Możesz wpisać nazwę firmy (np. 'Dino') albo dokładny ticker (np. 'DNP.WA') — aplikacja sama znajdzie właściwy symbol.")
     timeframe = st.selectbox("Interwał świec", ["15m", "1h", "1d"], index=1)
     refresh_seconds = st.number_input(
         "Auto-odśwież co (sekund)", min_value=15, max_value=3600, value=60, step=15
@@ -178,7 +223,7 @@ with st.sidebar:
     st.caption("To narzędzie analityczne, nie porada inwestycyjna.")
 
 period_map = {"15m": "60d", "1h": "180d", "1d": "2y"}
-tickers = [t.strip().upper() for t in tickers_input.splitlines() if t.strip()]
+tickers = [t.strip() for t in tickers_input.splitlines() if t.strip()]
 
 st_autorefresh(interval=refresh_seconds * 1000, key="refresh_watchlist")
 
@@ -188,17 +233,18 @@ rows = []
 results_by_ticker = {}
 
 with st.spinner("Analizuję listę instrumentów..."):
-    for ticker in tickers:
+    for query in tickers:
         try:
-            result = fetch_and_analyze(ticker, timeframe, period_map[timeframe])
+            result = fetch_and_analyze(query, timeframe, period_map[timeframe])
         except Exception as e:
             result = None
         if result is None:
-            rows.append({"Ticker": ticker, "Cena": None, "Sygnał": "BŁĄD", "Punkty": None})
+            rows.append({"Wpisano": query, "Ticker": "—", "Cena": None, "Sygnał": "BŁĄD", "Punkty": None})
             continue
-        results_by_ticker[ticker] = result
+        results_by_ticker[query] = result
         rows.append({
-            "Ticker": ticker,
+            "Wpisano": query,
+            "Ticker": result["ticker_used"],
             "Cena": round(result["price"], 4),
             "Sygnał": result["signal"],
             "Punkty": result["score"],
@@ -227,10 +273,11 @@ else:
     st.subheader("Szczegóły instrumentu")
     valid_tickers = [t for t in tickers if t in results_by_ticker]
     if valid_tickers:
-        selected = st.selectbox("Wybierz ticker do analizy szczegółowej", valid_tickers)
+        selected = st.selectbox("Wybierz instrument do analizy szczegółowej", valid_tickers)
         result = results_by_ticker[selected]
 
         signal_color = {"KUP": "🟢", "SPRZEDAJ": "🔴", "CZEKAJ": "🟡"}[result["signal"]]
+        st.caption(f"Rozpoznano jako: **{result['display_name']}** ({result['ticker_used']})")
         c1, c2, c3 = st.columns(3)
         c1.metric("Cena", f"{result['price']:.4f}")
         c2.metric("Sygnał", f"{signal_color} {result['signal']}")
@@ -239,7 +286,7 @@ else:
         plot_df = result["df"].tail(80)
         fig = go.Figure(data=[go.Candlestick(
             x=plot_df.index, open=plot_df["Open"], high=plot_df["High"],
-            low=plot_df["Low"], close=plot_df["Close"], name=selected,
+            low=plot_df["Low"], close=plot_df["Close"], name=result["ticker_used"],
         )])
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA20"], name="SMA20", line=dict(width=1)))
         fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df["SMA50"], name="SMA50", line=dict(width=1)))

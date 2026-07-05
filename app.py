@@ -48,13 +48,23 @@ def bollinger_bands(series: pd.Series, period=20, num_std=2):
     return sma + num_std * std, sma, sma - num_std * std
 
 
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["SMA20"] = df["Close"].rolling(20).mean()
     df["SMA50"] = df["Close"].rolling(50).mean()
+    df["SMA200"] = df["Close"].rolling(200).mean()
     df["RSI"] = rsi(df["Close"])
     df["MACD"], df["MACD_signal"], df["MACD_hist"] = macd(df["Close"])
     df["BB_upper"], df["BB_mid"], df["BB_lower"] = bollinger_bands(df["Close"])
+    df["ATR"] = atr(df)
     return df
 
 
@@ -150,11 +160,19 @@ def generate_signal(df: pd.DataFrame) -> dict:
     return {"signal": signal, "score": score, "price": last["Close"], "reasons": reasons, "df": df}
 
 
-def run_backtest(df: pd.DataFrame):
+def run_backtest(
+    df: pd.DataFrame,
+    use_trend_filter: bool = True,
+    stop_loss_pct: float = 8.0,
+    take_profit_pct: float = 15.0,
+):
     """
-    Symuluje realne transakcje wg naszej strategii: wejście na sygnale KUP,
-    wyjście na najbliższym kolejnym sygnale SPRZEDAJ (bez zaglądania w przyszłość).
-    Zwraca (tabela_transakcji, czy_pozycja_wciąż_otwarta, data_wejścia_otwartej_pozycji).
+    Symuluje realne transakcje wg dopracowanej strategii:
+    - Wejście na sygnale KUP, ale TYLKO gdy cena jest nad SMA200 (filtr głównego trendu),
+      żeby nie kupować wbrew długoterminowemu kierunkowi rynku.
+    - Wyjście: automatyczny Stop Loss / Take Profit (żeby nie czekać bezczynnie na
+      spóźniony sygnał SPRZEDAJ), albo sam sygnał SPRZEDAJ - co nastąpi pierwsze.
+    Zwraca (tabela_transakcji, czy_pozycja_wciąż_otwarta, data_wejścia_otwartej, cena_wejścia_otwartej).
     """
     df_ind = add_indicators(df)
     trades = []
@@ -162,9 +180,42 @@ def run_backtest(df: pd.DataFrame):
     entry_price = None
     entry_date = None
 
-    for i in range(55, len(df_ind)):
+    min_bars = 200 if use_trend_filter else 55
+
+    for i in range(min_bars, len(df_ind)):
         last = df_ind.iloc[i]
         prev = df_ind.iloc[i - 1]
+
+        # --- Sprawdzenie wyjścia z pozycji (Stop Loss / Take Profit) na bieżącej świecy ---
+        if in_position:
+            stop_price = entry_price * (1 - stop_loss_pct / 100)
+            target_price = entry_price * (1 + take_profit_pct / 100)
+            hit_stop = last["Low"] <= stop_price
+            hit_target = last["High"] >= target_price
+
+            exit_price = None
+            exit_reason = None
+            if hit_stop:
+                exit_price, exit_reason = stop_price, "Stop Loss"
+            elif hit_target:
+                exit_price, exit_reason = target_price, "Take Profit"
+
+            if exit_price is not None:
+                exit_date = df_ind.index[i]
+                ret_pct = (exit_price - entry_price) / entry_price * 100
+                trades.append({
+                    "Data kupna": entry_date,
+                    "Cena kupna": round(entry_price, 4),
+                    "Data sprzedaży": exit_date,
+                    "Cena sprzedaży": round(exit_price, 4),
+                    "Dni w pozycji": (exit_date - entry_date).days,
+                    "Zwrot %": round(ret_pct, 2),
+                    "Trafiony": ret_pct > 0,
+                    "Wyjście": exit_reason,
+                })
+                in_position = False
+
+        # --- Liczenie sygnału (do wejścia i do sygnałowego wyjścia) ---
         score = 0
 
         if pd.notna(last["RSI"]):
@@ -200,11 +251,8 @@ def run_backtest(df: pd.DataFrame):
         else:
             signal = "CZEKAJ"
 
-        if signal == "KUP" and not in_position:
-            in_position = True
-            entry_price = last["Close"]
-            entry_date = df_ind.index[i]
-        elif signal == "SPRZEDAJ" and in_position:
+        # --- Sygnałowe wyjście (jeśli SL/TP nie zadziałał wcześniej na tej świecy) ---
+        if in_position and signal == "SPRZEDAJ":
             exit_price = last["Close"]
             exit_date = df_ind.index[i]
             ret_pct = (exit_price - entry_price) / entry_price * 100
@@ -216,8 +264,19 @@ def run_backtest(df: pd.DataFrame):
                 "Dni w pozycji": (exit_date - entry_date).days,
                 "Zwrot %": round(ret_pct, 2),
                 "Trafiony": ret_pct > 0,
+                "Wyjście": "Sygnał SPRZEDAJ",
             })
             in_position = False
+
+        # --- Wejście w pozycję ---
+        if not in_position and signal == "KUP":
+            trend_ok = True
+            if use_trend_filter:
+                trend_ok = pd.notna(last["SMA200"]) and last["Close"] > last["SMA200"]
+            if trend_ok:
+                in_position = True
+                entry_price = last["Close"]
+                entry_date = df_ind.index[i]
 
     return pd.DataFrame(trades), in_position, entry_date, entry_price
 
@@ -544,7 +603,20 @@ with tab3:
         bt_query = st.text_input("Instrument (nazwa firmy albo ticker)", value="AAPL", key="bt_query")
         bt_timeframe = st.selectbox("Interwał świec", ["1h", "1d"], index=1, key="bt_timeframe")
         bt_period_map = {"1h": "730d", "1d": "5y"}
-        st.caption("Symulacja: wejście na sygnale KUP, wyjście na najbliższym kolejnym sygnale SPRZEDAJ.")
+        st.markdown("**Dopracowana strategia:**")
+        use_trend_filter = st.checkbox(
+            "Filtr trendu (kupuj tylko nad SMA200)", value=True, key="bt_trend_filter"
+        )
+        stop_loss_pct = st.number_input(
+            "Stop Loss %", min_value=1.0, max_value=50.0, value=8.0, step=1.0, key="bt_sl"
+        )
+        take_profit_pct = st.number_input(
+            "Take Profit %", min_value=1.0, max_value=100.0, value=15.0, step=1.0, key="bt_tp"
+        )
+        st.caption(
+            "Wejście na sygnale KUP (nad SMA200, jeśli filtr włączony). "
+            "Wyjście: Stop Loss, Take Profit albo sygnał SPRZEDAJ — co nastąpi pierwsze."
+        )
         run_bt = st.button("▶️ Uruchom backtest", type="primary", use_container_width=True)
 
     if run_bt and bt_query:
@@ -572,7 +644,12 @@ with tab3:
         if df_bt.empty or len(df_bt) < 60:
             st.error(f"Nie znaleziono wystarczających danych dla '{bt_query}'.")
         else:
-            trades, still_open, open_entry_date, open_entry_price = run_backtest(df_bt)
+            trades, still_open, open_entry_date, open_entry_price = run_backtest(
+                df_bt,
+                use_trend_filter=use_trend_filter,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+            )
 
             if trades.empty:
                 st.warning(
@@ -601,6 +678,10 @@ with tab3:
                     "Zwrot łączny (składany, wszystkie transakcje po sobie)",
                     f"{total_return:+.1f}%",
                 )
+
+                exit_counts = trades["Wyjście"].value_counts()
+                exit_summary = " · ".join(f"{k}: {v}" for k, v in exit_counts.items())
+                st.caption(f"Powody wyjścia z pozycji — {exit_summary}")
 
                 if still_open:
                     st.info(
@@ -634,5 +715,52 @@ with tab3:
                     "kupno na sygnale KUP, sprzedaż na najbliższym kolejnym sygnale SPRZEDAJ. "
                     "Wyniki historyczne nie gwarantują przyszłych rezultatów. To narzędzie analityczne, nie porada inwestycyjna."
                 )
+
+            st.divider()
+            st.markdown("### 🔧 Automatyczna optymalizacja parametrów")
+            st.caption(
+                "Przetestuje ~40 kombinacji Stop Loss / Take Profit / filtra trendu na historii tego instrumentu "
+                "i pokaże, które dały najlepszy łączny wynik. Uwaga: to dopasowanie do przeszłości (overfitting) — "
+                "najlepsza kombinacja z historii nie musi być najlepsza w przyszłości."
+            )
+            if st.button("Znajdź najlepsze ustawienia dla tego instrumentu", key="opt_btn"):
+                with st.spinner("Testuję kombinacje..."):
+                    combos = []
+                    for tf_opt in [True, False]:
+                        for sl_opt in [4, 6, 8, 12, 16]:
+                            for tp_opt in [10, 15, 20, 30]:
+                                t_opt, _, _, _ = run_backtest(
+                                    df_bt, use_trend_filter=tf_opt,
+                                    stop_loss_pct=sl_opt, take_profit_pct=tp_opt,
+                                )
+                                if len(t_opt) == 0:
+                                    continue
+                                total_ret_opt = ((1 + t_opt["Zwrot %"] / 100).prod() - 1) * 100
+                                combos.append({
+                                    "Filtr trendu": "Tak" if tf_opt else "Nie",
+                                    "Stop Loss %": sl_opt,
+                                    "Take Profit %": tp_opt,
+                                    "Transakcje": len(t_opt),
+                                    "Win rate %": round(t_opt["Trafiony"].mean() * 100, 0),
+                                    "Zwrot łączny %": round(total_ret_opt, 1),
+                                })
+
+                if not combos:
+                    st.warning("Żadna kombinacja nie wygenerowała transakcji w tym okresie.")
+                else:
+                    combos_df = pd.DataFrame(combos).sort_values("Zwrot łączny %", ascending=False)
+                    st.dataframe(
+                        combos_df.head(15).reset_index(drop=True),
+                        use_container_width=True, hide_index=True,
+                    )
+                    best = combos_df.iloc[0]
+                    st.success(
+                        f"Najlepsza znaleziona kombinacja: Stop Loss {best['Stop Loss %']:.0f}%, "
+                        f"Take Profit {best['Take Profit %']:.0f}%, filtr trendu: {best['Filtr trendu']} "
+                        f"→ {best['Transakcje']:.0f} transakcji, win rate {best['Win rate %']:.0f}%, "
+                        f"zwrot łączny {best['Zwrot łączny %']:+.1f}%. "
+                        f"Wpisz te wartości w panelu po lewej i kliknij 'Uruchom backtest' ponownie, "
+                        f"żeby zobaczyć szczegóły."
+                    )
     elif not bt_query:
         st.info("Wpisz instrument w panelu po lewej i kliknij 'Uruchom backtest'.")
